@@ -47,7 +47,7 @@ jobs:
 
             docker run -d \
               --network app-net \
-              -p 80:80 \
+              -p 8080:8080 \
               --name ${{ env.DOCKER_IMAGE }} \
               -e SPRING_DATASOURCE_URL="jdbc:mysql://${MYSQL_CONTAINER}:3306/charge_station?useSSL=false" \
               ${{ env.DOCKER_IMAGE }}
