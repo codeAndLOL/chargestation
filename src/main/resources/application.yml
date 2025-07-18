@@ -1,0 +1,16 @@
+spring:
+  profiles:
+    active: dev  # 默认激活开发环境
+
+# 公共配置（所有环境共享）
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      logic-delete-field: status
+      logic-delete-value: 0
+      logic-not-delete-value: 1
+
+swagger:
+  enable: true
