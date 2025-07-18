@@ -25,23 +25,26 @@ jobs:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ env.EC2_IP }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
-            # 网络和MySQL配置
-            docker network create app-net || true
+            # 清理旧容器
+            docker stop mysql app || true
+            docker rm mysql app || true
+            docker network rm app-net || true
+
+            # 重建基础设施
+            docker network create app-net
             docker run -d \
               --network app-net \
-              --name ${{ env.MYSQL_CONTAINER }} \
+              --name mysql \
               -e MYSQL_ROOT_PASSWORD=root \
               -v mysql_data:/var/lib/mysql \
               mysql:8.0
 
-            # 应用部署（使用纯镜像名）
+            # 本地构建并运行应用
+            docker build -t charge-station .
             docker run -d \
               --network app-net \
               -p 80:80 \
-              --name ${{ env.DOCKER_IMAGE }} \
+              --name app \
               -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/charge_station?useSSL=false" \
-              ${{ env.DOCKER_IMAGE }}
+              charge-station
