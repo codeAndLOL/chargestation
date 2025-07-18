@@ -35,8 +35,9 @@ jobs:
       - name: Network Test
         run: |
           echo "===== 网络测试 ====="
+          # 禁用严格主机检查
+          ssh -o StrictHostKeyChecking=no -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "echo 'SSH连接成功'" || exit 1
           nc -zv ${{ env.EC2_IP }} 22 || exit 1
-          ssh -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "echo 'SSH连接成功'" || exit 1
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -49,10 +50,9 @@ jobs:
             docker rm -f ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker network rm app-net || true
 
-            # 2. 可靠传输镜像（带校验）
-            scp -v -i /tmp/key.pem /tmp/image.tar ec2-user@${{ env.EC2_IP }}:/tmp/
-            ssh -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
-              echo '文件大小: $(ls -lh /tmp/image.tar)'
+            # 2. 可靠传输镜像
+            scp -o StrictHostKeyChecking=no -i /tmp/key.pem /tmp/image.tar ec2-user@${{ env.EC2_IP }}:/tmp/
+            ssh -o StrictHostKeyChecking=no -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
               docker load -i /tmp/image.tar || { echo '[ERROR] 镜像加载失败'; exit 1; }
               docker inspect ${{ env.DOCKER_IMAGE }} || exit 1
             "
@@ -74,15 +74,14 @@ jobs:
               ${{ env.DOCKER_IMAGE }}
 
             # 4. 健康检查
-            ssh -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
-              for i in {1..2}; do
+            ssh -o StrictHostKeyChecking=no -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
+              for i in {1..3}; do
                 if docker logs ${{ env.DOCKER_IMAGE }} | grep 'Started Application'; then
-                  echo '应用启动成功'
+                  curl -fsS http://localhost:8080/actuator/health || exit 1
                   exit 0
                 fi
                 sleep 10
               done
-              echo '[ERROR] 启动超时'
               docker logs ${{ env.DOCKER_IMAGE }} --tail 50
               exit 1
             "
