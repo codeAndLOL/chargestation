@@ -24,8 +24,11 @@ jobs:
       - name: Build Docker image
         run: docker build -t ${{ env.DOCKER_IMAGE }} .
 
-      - name: Export Docker Image
-        run: docker save ${{ env.DOCKER_IMAGE }} -o image.tar
+      - name: Prepare Deployment
+        run: |
+          docker save ${{ env.DOCKER_IMAGE }} -o image.tar
+          # 压缩镜像文件加速传输
+          tar czf image.tar.gz image.tar
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -34,12 +37,18 @@ jobs:
           username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
-
+            # 清理旧容器
             docker stop ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker rm ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker network rm app-net || true
 
+            # 传输镜像文件（关键修复）
+            echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > key.pem
+            chmod 600 key.pem
+            scp -o StrictHostKeyChecking=no -i key.pem image.tar.gz ec2-user@${{ env.EC2_IP }}:/tmp/
+            ssh -i key.pem ec2-user@${{ env.EC2_IP }} "tar xzf /tmp/image.tar.gz -C /tmp/"
 
+            # 启动基础设施
             docker network create app-net
             docker run -d \
               --network app-net \
@@ -49,16 +58,17 @@ jobs:
               -v mysql_data:/var/lib/mysql \
               mysql:8.0
 
-
-            docker load -i image.tar
+            # 加载并启动应用
+            docker load -i /tmp/image.tar
             docker run -d \
               --network app-net \
               -p 8080:8080 \
+              -v /var/log/charge-station:/app/logs \
               --name ${{ env.DOCKER_IMAGE }} \
               -e SPRING_DATASOURCE_URL="jdbc:mysql://${MYSQL_CONTAINER}:3306/charge_station?useSSL=false" \
               ${{ env.DOCKER_IMAGE }}
 
-            # 验证部署
-            sleep 10
-            curl -v http://localhost:8080/actuator/health
+            # 增强健康检查（最多等待60秒）
+            timeout 60 bash -c 'until curl -sf http://localhost:8080/actuator/health | grep -q "UP"; do sleep 5; done'
             docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            curl -v http://localhost:8080/actuator/health
