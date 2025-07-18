@@ -21,13 +21,11 @@ jobs:
           mvn clean package -DskipTests
           ls -l target/*.jar
 
-      - name: Build Docker image
-        run: docker build -t ${{ env.DOCKER_IMAGE }} .
-
-      - name: Prepare Deployment
+      - name: Build and Export Docker Image
         run: |
-          docker save ${{ env.DOCKER_IMAGE }} -o image.tar
-          gzip -k image.tar  # 保留原文件
+          docker build -t ${{ env.DOCKER_IMAGE }} .
+          docker save ${{ env.DOCKER_IMAGE }} -o /tmp/image.tar
+          ls -lh /tmp/image.tar
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -40,10 +38,10 @@ jobs:
             docker rm ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker network rm app-net || true
 
-            echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > key.pem
-            chmod 600 key.pem
-            rsync -avz -e "ssh -o StrictHostKeyChecking=no -i key.pem" image.tar.gz ec2-user@${{ env.EC2_IP }}:/tmp/
-            ssh -i key.pem ec2-user@${{ env.EC2_IP }} "gzip -df /tmp/image.tar.gz && docker load -i /tmp/image.tar"
+            echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/key.pem
+            chmod 600 /tmp/key.pem
+            scp -o StrictHostKeyChecking=no -i /tmp/key.pem /tmp/image.tar ec2-user@${{ env.EC2_IP }}:/tmp/
+            ssh -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "docker load -i /tmp/image.tar"
 
             docker network create app-net
             docker run -d \
@@ -63,12 +61,19 @@ jobs:
               ${{ env.DOCKER_IMAGE }}
 
             for i in {1..12}; do
-              docker logs ${{ env.DOCKER_IMAGE }} --tail 20
-              if curl -sf http://localhost:8080/actuator/health | grep -q "UP"; then
-                echo "✅ Health check passed"
+              echo "Attempt $i: Checking service status..."
+              CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' ${{ env.DOCKER_IMAGE }})
+              HEALTH=$(curl -s http://localhost:8080/actuator/health || echo "curl_failed")
+
+              if [[ "$CONTAINER_STATUS" == "running" && "$HEALTH" == *"UP"* ]]; then
+                echo "✅ Service is healthy"
                 exit 0
               fi
+
+              docker logs ${{ env.DOCKER_IMAGE }} --tail 20
               sleep 5
             done
-            echo "❌ Health check failed after 60 seconds"
+
+            echo "❌ Service failed to start"
+            docker inspect ${{ env.DOCKER_IMAGE }}
             exit 1
