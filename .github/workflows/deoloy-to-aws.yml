@@ -8,6 +8,7 @@ env:
   EC2_IP: "54.180.93.68"
   EC2_USER: "ec2-user"
   DOCKER_IMAGE: "charge-station"
+  MYSQL_CONTAINER: "mysql"
 
 jobs:
   deploy:
@@ -15,10 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. 清理并构建JAR（关键新增步骤）
+      - name: Build with Maven
+        run: |
+          mvn clean package -DskipTests
+          ls -l target/  # 验证JAR文件生成
+
+      # 2. 构建Docker镜像
       - name: Build Docker image
         run: docker build -t ${{ env.DOCKER_IMAGE }} .
 
-
+      # 3. SSH部署（包含MySQL集成）
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
@@ -26,15 +34,30 @@ jobs:
           username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
-            # 停止并删除旧容器
+            # 启动MySQL容器（如果不存在）
+            docker ps -a | grep ${{ env.MYSQL_CONTAINER }} || \
+            docker run -d \
+              --name ${{ env.MYSQL_CONTAINER }} \
+              -e MYSQL_ROOT_PASSWORD=root \
+              -e MYSQL_DATABASE=charge_station \
+              -p 3306:3306 \
+              -v mysql_data:/var/lib/mysql \
+              mysql:8.0
+
+            # 停止并删除旧应用容器
             docker stop ${{ env.DOCKER_IMAGE }} || true
             docker rm ${{ env.DOCKER_IMAGE }} || true
 
-            # 启动新容器
+            # 启动Spring Boot容器（链接到MySQL）
             docker run -d \
+              --link ${{ env.MYSQL_CONTAINER }} \
               -p 80:80 \
               --name ${{ env.DOCKER_IMAGE }} \
+              -e SPRING_DATASOURCE_URL="jdbc:mysql://${{ env.MYSQL_CONTAINER }}:3306/charge_station?useSSL=false&timezone=Asia/Shanghai" \
+              -e SPRING_DATASOURCE_USERNAME=root \
+              -e SPRING_DATASOURCE_PASSWORD=root \
               ${{ env.DOCKER_IMAGE }}
 
-            # 验证容器状态
-            docker ps | grep ${{ env.DOCKER_IMAGE }}
+            # 验证部署
+            docker ps
+            docker logs ${{ env.DOCKER_IMAGE }} --tail 50
