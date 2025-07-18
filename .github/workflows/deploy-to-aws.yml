@@ -21,41 +21,43 @@ jobs:
           mvn clean package -DskipTests
           ls -l target/*.jar
 
-      - name: Build and Export Docker Image
+      - name: Build and Validate Image
         run: |
           docker build -t ${{ env.DOCKER_IMAGE }} .
           docker save ${{ env.DOCKER_IMAGE }} -o /tmp/image.tar
-          ls -lh /tmp/image.tar
+          ls -lh /tmp/image.tar || { echo "[ERROR] 镜像导出失败"; exit 1; }
+          md5sum /tmp/image.tar > /tmp/image.md5
 
       - name: Prepare SSH Key
         run: |
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/key.pem
           chmod 600 /tmp/key.pem
 
-      - name: Network Test
+      - name: Transfer with Verification
         run: |
-          echo "===== 网络测试 ====="
-          # 禁用严格主机检查
-          ssh -o StrictHostKeyChecking=no -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "echo 'SSH连接成功'" || exit 1
-          nc -zv ${{ env.EC2_IP }} 22 || exit 1
+          # 强制传输文件+校验文件
+          scp -v -i /tmp/key.pem /tmp/image.tar /tmp/image.md5 ec2-user@${{ env.EC2_IP }}:/tmp/
 
-      - name: Deploy via SSH
+          # 验证传输结果
+          ssh -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
+            echo '文件大小: $(ls -lh /tmp/image.tar)'
+            md5sum -c /tmp/image.md5 || { echo '[ERROR] 文件校验失败'; exit 1; }
+          "
+
+      - name: Deploy Services
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ env.EC2_IP }}
           username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
-            # 1. 清理环境
+            # 1. 清理旧容器
             docker rm -f ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker network rm app-net || true
 
-            # 2. 可靠传输镜像
-            scp -o StrictHostKeyChecking=no -i /tmp/key.pem /tmp/image.tar ec2-user@${{ env.EC2_IP }}:/tmp/
-            ssh -o StrictHostKeyChecking=no -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
-              docker load -i /tmp/image.tar || { echo '[ERROR] 镜像加载失败'; exit 1; }
-              docker inspect ${{ env.DOCKER_IMAGE }} || exit 1
-            "
+            # 2. 加载镜像（严格检查）
+            docker load -i /tmp/image.tar || { echo '[ERROR] 镜像加载失败'; exit 1; }
+            docker inspect ${{ env.DOCKER_IMAGE }} || exit 1
 
             # 3. 启动服务
             docker network create app-net
@@ -74,14 +76,13 @@ jobs:
               ${{ env.DOCKER_IMAGE }}
 
             # 4. 健康检查
-            ssh -o StrictHostKeyChecking=no -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
-              for i in {1..3}; do
-                if docker logs ${{ env.DOCKER_IMAGE }} | grep 'Started Application'; then
-                  curl -fsS http://localhost:8080/actuator/health || exit 1
-                  exit 0
-                fi
-                sleep 10
+            timeout 60 bash -c '
+              while ! docker logs ${{ env.DOCKER_IMAGE }} | grep "Started Application"; do
+                sleep 5
               done
+              curl -fsS http://localhost:8080/actuator/health
+            ' || {
+              echo "[ERROR] 启动超时，最后50行日志："
               docker logs ${{ env.DOCKER_IMAGE }} --tail 50
               exit 1
-            "
+            }
