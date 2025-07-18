@@ -25,7 +25,17 @@ jobs:
         run: |
           docker build -t ${{ env.DOCKER_IMAGE }} .
           docker save ${{ env.DOCKER_IMAGE }} -o image.tar
-          ls -lh image.tar  # 验证文件生成
+          ls -lh image.tar
+
+      - name: Network Diagnostic
+        run: |
+          echo "===== 网络连接测试 ====="
+          ping -c 4 ${{ env.EC2_IP }}
+          nc -zv ${{ env.EC2_IP }} 22
+          echo "===== 传输测试 ====="
+          echo "test" > network_test.txt
+          scp -v -o StrictHostKeyChecking=no network_test.txt ec2-user@${{ env.EC2_IP }}:/tmp/
+          ssh ec2-user@${{ env.EC2_IP }} "ls -l /tmp/network_test.txt && cat /tmp/network_test.txt"
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -34,20 +44,21 @@ jobs:
           username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
-            # 1. 强制清理旧容器
-            docker rm -f ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
-            docker network rm app-net || true
+            # 1. 打印环境信息
+            echo "===== 部署环境 ====="
+            uname -a
+            df -h
+            docker info
 
-            # 2. 传输镜像文件（直接使用Action工作目录）
+            # 2. 强制传输镜像（带MD5校验）
             scp -o StrictHostKeyChecking=no image.tar ec2-user@${{ env.EC2_IP }}:/tmp/
-
-            # 3. 加载镜像（强制覆盖）
             ssh ec2-user@${{ env.EC2_IP }} "
+              echo '传输文件MD5: $(md5sum /tmp/image.tar)'
               docker load -i /tmp/image.tar
-              docker images | grep ${{ env.DOCKER_IMAGE }} || exit 1
+              docker images | grep ${{ env.DOCKER_IMAGE }} || { echo '[ERROR] 镜像加载失败'; exit 1; }
             "
 
-            # 4. 启动服务（精简版）
+            # 3. 启动服务（带实时日志输出）
             docker network create app-net
             docker run -d \
               --network app-net \
@@ -63,6 +74,15 @@ jobs:
               --name ${{ env.DOCKER_IMAGE }} \
               ${{ env.DOCKER_IMAGE }}
 
-            # 5. 一次性验证
-            sleep 15  # 等待应用启动
-            curl -fsS http://localhost:8080/actuator/health || exit 1
+            # 4. 智能健康检查（带超时控制）
+            timeout 60 bash -c '
+              while ! docker logs ${{ env.DOCKER_IMAGE }} | grep "Started Application"; do
+                echo "[$(date)] 等待应用启动..."
+                sleep 5
+              done
+              curl -fsS http://localhost:8080/actuator/health
+            ' || {
+              echo "[ERROR] 应用启动超时"
+              docker logs ${{ env.DOCKER_IMAGE }} --tail 50
+              exit 1
+            }
