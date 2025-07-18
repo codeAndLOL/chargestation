@@ -24,6 +24,9 @@ jobs:
       - name: Build Docker image
         run: docker build -t ${{ env.DOCKER_IMAGE }} .
 
+      - name: Export Docker Image
+        run: docker save ${{ env.DOCKER_IMAGE }} -o image.tar
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
@@ -31,12 +34,13 @@ jobs:
           username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
+
             docker stop ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker rm ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker network rm app-net || true
 
-            docker network create app-net
 
+            docker network create app-net
             docker run -d \
               --network app-net \
               --name ${{ env.MYSQL_CONTAINER }} \
@@ -45,6 +49,8 @@ jobs:
               -v mysql_data:/var/lib/mysql \
               mysql:8.0
 
+
+            docker load -i image.tar
             docker run -d \
               --network app-net \
               -p 8080:8080 \
@@ -52,5 +58,7 @@ jobs:
               -e SPRING_DATASOURCE_URL="jdbc:mysql://${MYSQL_CONTAINER}:3306/charge_station?useSSL=false" \
               ${{ env.DOCKER_IMAGE }}
 
+            # 验证部署
+            sleep 10
+            curl -v http://localhost:8080/actuator/health
             docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-            curl -s http://localhost:80/actuator/health || echo "Health check failed"
