@@ -33,17 +33,41 @@ jobs:
         run: |
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/key.pem
           chmod 600 /tmp/key.pem
-          echo -e "Host *\n  StrictHostKeyChecking no" > /tmp/ssh_config
+          echo -e "Host *\n  StrictHostKeyChecking no\n  ConnectTimeout 30" > /tmp/ssh_config
+
+      - name: Test SSH Connection
+        run: |
+          echo "=== 测试SSH连接 ==="
+          ssh -F /tmp/ssh_config -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "echo 'SSH连接成功'" || {
+            echo "::error::SSH连接失败，请检查："
+            echo "1. EC2安全组是否开放22端口"
+            echo "2. 实例是否运行中"
+            echo "3. 密钥是否正确"
+            exit 1
+          }
 
       - name: Guaranteed Transfer
         run: |
+          echo "=== 分块传输镜像 ==="
           split -b 50M /tmp/image.tar /tmp/image.part.
-          scp -F /tmp/ssh_config -i /tmp/key.pem /tmp/image.part.* ec2-user@${{ env.EC2_IP }}:/tmp/
+
+          echo "传输分块文件..."
+          for part in /tmp/image.part.*; do
+            scp -F /tmp/ssh_config -i /tmp/key.pem $part ec2-user@${{ env.EC2_IP }}:/tmp/
+          done
+
+          echo "传输校验文件..."
           scp -F /tmp/ssh_config -i /tmp/key.pem /tmp/image.md5 ec2-user@${{ env.EC2_IP }}:/tmp/
+
+          echo "合并并验证文件..."
           ssh -F /tmp/ssh_config -i /tmp/key.pem ec2-user@${{ env.EC2_IP }} "
+            echo '合并分块文件...'
             cat /tmp/image.part.* > /tmp/image.tar
             rm -f /tmp/image.part.*
+            echo '校验文件完整性...'
             md5sum -c /tmp/image.md5 || { echo '[ERROR] 文件校验失败'; exit 1; }
+            echo '当前磁盘空间:'
+            df -h /tmp
           "
 
       - name: Deploy Services
@@ -53,16 +77,20 @@ jobs:
           username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script: |
-            # 清理环境
+            # 1. 清理环境
+            echo "=== 清理旧容器 ==="
             docker rm -f ${{ env.MYSQL_CONTAINER }} ${{ env.DOCKER_IMAGE }} || true
             docker network rm app-net || true
 
-            # 加载镜像
+            # 2. 加载镜像
+            echo "=== 加载镜像 ==="
             docker load -i /tmp/image.tar || { echo '[ERROR] 镜像加载失败'; exit 1; }
-            docker images | grep ${{ env.DOCKER_IMAGE }} || { echo '[ERROR] 镜像不存在'; exit 1; }
+            docker inspect ${{ env.DOCKER_IMAGE }} || { echo '[ERROR] 镜像不存在'; exit 1; }
 
-            # 启动服务
+            # 3. 启动服务
+            echo "=== 启动服务 ==="
             docker network create app-net
+            echo "启动MySQL..."
             docker run -d \
               --network app-net \
               --name ${{ env.MYSQL_CONTAINER }} \
@@ -71,28 +99,36 @@ jobs:
               -v mysql_data:/var/lib/mysql \
               mysql:8.0
 
+            echo "启动应用..."
             docker run -d \
               --network app-net \
               -p 8080:8080 \
               --name ${{ env.DOCKER_IMAGE }} \
               ${{ env.DOCKER_IMAGE }}
 
-            # 健康检查（使用Swagger接口）
-            echo "等待应用启动..."
+            # 4. 健康检查
+            echo "=== 健康检查 ==="
             for i in {1..2}; do
-              if docker logs ${{ env.DOCKER_IMAGE }} 2>&1 | grep "Started Application"; then
+              echo "[尝试 $i/3] 检查应用状态..."
+
+              # 检查日志关键词
+              if docker logs ${{ env.DOCKER_IMAGE }} 2>&1 | grep -q "Started Application"; then
                 echo "检测到启动日志，验证Swagger接口..."
-                if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/swagger-ui.html | grep -q "200\|302"; then
-                  echo "Swagger页面访问成功"
+
+                # 检查Swagger页面
+                STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/swagger-ui.html)
+                if [[ $STATUS_CODE =~ ^(200|302)$ ]]; then
+                  echo "Swagger页面访问成功 (HTTP $STATUS_CODE)"
                   exit 0
                 else
-                  echo "[WARN] Swagger页面无响应"
+                  echo "[WARN] Swagger页面响应异常 (HTTP $STATUS_CODE)"
                 fi
               fi
-              echo "[尝试 $i/3] 等待5秒..."
+
               sleep 5
             done
 
-            echo "[ERROR] 启动失败，最后日志："
+            echo "::error::应用启动失败"
+            echo "=== 最后50行日志 ==="
             docker logs ${{ env.DOCKER_IMAGE }} --tail 50
             exit 1
